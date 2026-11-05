@@ -1,0 +1,221 @@
+# CoAP Remote Storage — Server
+
+Server de stocare la distanță (remote storage) peste **CoAP** (RFC 7252), implementat exclusiv cu modulul `socket`, fără biblioteci CoAP sau alte module pentru stiva de comunicație. Un client CoAP (dezvoltat separat, cu interfață grafică) poate încărca, descărca, șterge, muta fișiere și poate naviga prin structura de directoare de pe server.
+
+Proiect realizat pentru un curs din cadrul TUIASI. Protocolul este definit într-o specificație comună, respectată atât de server, cât și de client.
+
+## Cuprins
+
+- [Funcționalități](#funcționalități)
+- [Stare implementare](#stare-implementare)
+- [Rulare](#rulare)
+- [Protocol](#protocol)
+- [Comportament în cazuri-limită](#comportament-în-cazuri-limită)
+- [Structura proiectului](#structura-proiectului)
+- [Testare](#testare)
+- [Limitări cunoscute](#limitări-cunoscute)
+- [Referințe](#referințe)
+
+## Funcționalități
+
+- Listare, descărcare, creare director, încărcare, ștergere și mutare/redenumire de fișiere și directoare
+- Transfer pe blocuri (Block1 pentru încărcare, Block2 pentru descărcare, RFC 7959), cu verificare de integritate prin CRC32
+- Mesaje confirmabile (CON) și neconfirmabile (NON)
+- Deduplicarea cererilor CON retransmise
+- Ping CoAP (CON 0.00 → RST)
+- Protecție împotriva ieșirii din rădăcina de stocare (`.` și `..` sunt respinse)
+
+## Stare implementare
+
+Bifează pe măsură ce avansezi.
+
+- [ ] Codec mesaje CoAP (header, token, opțiuni, payload)
+- [ ] Loop UDP, Ping, deduplicare
+- [ ] Listare, creare director, ștergere, mutare
+- [ ] Descărcare cu Block2 și ETag/CRC32
+- [ ] Încărcare cu Block1 și răspuns cu CRC32
+- [ ] Comunicare NON
+- [ ] Răspuns separat (ACK 0.00, apoi CON)
+
+## Rulare
+
+Cerințe: Python 3.10+ (doar biblioteca standard).
+
+```bash
+git clone <url-repo>
+cd <nume-repo>
+python server.py --root ./storage --host 0.0.0.0 --port 5683
+```
+
+| Argument | Rol | Implicit |
+| :---- | :---- | :---- |
+| `--root` | Directorul de pe disc mapat la `/fs` | `./storage` |
+| `--host` | Adresa pe care ascultă serverul | `0.0.0.0` |
+| `--port` | Portul UDP | `5683` |
+
+Serverul scrie în consolă câte o linie pentru fiecare cerere (metodă, cale, cod de răspuns).
+
+## Protocol
+
+### Transport
+
+- UDP, port 5683
+- Câmpurile numerice sunt în network order (big-endian)
+- Payload maxim per datagram: 1024 B
+- Mesaje conform RFC 7252 (Ver = 1, token 0–8 B)
+
+### Opțiuni folosite
+
+Opțiunile se trimit sortate crescător după număr.
+
+| Opțiune | Număr | Rol |
+| :---- | :---- | :---- |
+| ETag | 4 | CRC32 al întregului fișier, la descărcare (4 B) |
+| Uri-Path | 11 | Un segment de cale per opțiune |
+| Content-Format | 12 | 42 pentru fișiere (octeți bruți), 50 pentru JSON |
+| Uri-Query | 15 | Parametri (ex. `type=dir`) |
+| Block2 | 23 | Blocuri la descărcare |
+| Block1 | 27 | Blocuri la încărcare |
+| Size1 | 60 | Dimensiunea totală, în primul bloc de la încărcare |
+
+### Operații
+
+Toate căile încep cu `/fs`, care reprezintă rădăcina de stocare.
+
+| Operație | Metodă | URI | Cerere | Succes |
+| :---- | :---- | :---- | :---- | :---- |
+| Listare director | GET | `/fs/<cale>` | gol | 2.05 + JSON |
+| Descărcare fișier | GET | `/fs/<cale>` | gol, cu Block2 | 2.05, pe blocuri |
+| Creare director | POST | `/fs/<cale>?type=dir` | gol | 2.01 |
+| Încărcare fișier | POST | `/fs/<cale>` | blocuri, cu Block1 | 2.01 + JSON |
+| Ștergere | DELETE (0.04) | `/fs/<cale>` | gol | 2.02 |
+| Mutare / redenumire | MOVE (0.08) | `/fs/<sursă>` | JSON cu destinația | 2.04 |
+| Ping | 0.00, CON | n/a | n/a | RST |
+
+Serverul decide între listare și descărcare după tipul țintei (director sau fișier). `MOVE` este o metodă proprie, cu codul 0.08, nealocat în RFC-uri.
+
+### Coduri de eroare
+
+| Cod | Semnificație |
+| :---- | :---- |
+| 4.00 | Cerere invalidă (inclusiv căi cu `..`) |
+| 4.04 | Calea nu există |
+| 4.05 | Metodă nepermisă pe acea resursă |
+| 4.08 | Bloc Block1 în afara ordinii |
+| 4.09 | Există deja |
+| 4.13 | Fișier prea mare |
+| 5.00 | Eroare internă |
+
+Răspunsurile de eroare poartă un JSON cu mesajul, cu Content-Format 50:
+
+```json
+{"error":"fișierul nu există"}
+```
+
+### Formate de payload
+
+**Listare** (Content-Format 50):
+
+```json
+{"entries":[{"name":"a.txt","type":"file","size":1234},{"name":"docs","type":"dir"}]}
+```
+
+**Mutare** (cerere, Content-Format 50):
+
+```json
+{"dest":"/fs/docs/b.txt"}
+```
+
+**Răspuns la încărcare** (2.01, Content-Format 50):
+
+```json
+{"size":1234,"crc32":"1a2b3c4d"}
+```
+
+CRC32 este cel standard (IEEE, ca în `zlib.crc32`), scris în hex minuscul, 8 caractere. La descărcare, fiecare răspuns Block2 poartă opțiunea ETag cu CRC32 al întregului fișier (4 B, big-endian), iar clientul îl verifică după ultimul bloc.
+
+### Transfer pe blocuri (RFC 7959)
+
+- Dimensiune bloc: 1024 B (SZX = 6). Serverul poate micșora valoarea, iar clientul respectă ce primește în răspuns.
+- Valoarea opțiunilor Block1/Block2 este `NUM | M | SZX`.
+- **Încărcare:** clientul trimite POST cu Block1 `NUM` = 0, 1, 2, …, cu `M` = 1 până la ultimul bloc (`M` = 0). Size1 apare în primul bloc. Serverul răspunde 2.31 Continue pentru fiecare bloc intermediar și 2.01 pentru ultimul.
+- **Descărcare:** clientul trimite GET cu Block2 `NUM` = 0, 1, 2, …, iar serverul răspunde 2.05 cu blocul cerut, `M` = 1 până la ultimul.
+- Fiecare bloc este un schimb separat, cu Message ID nou și token nou.
+- Fișier gol: un singur bloc, `NUM` = 0, `M` = 0.
+
+### Fiabilitate
+
+- **CON:** ACK_TIMEOUT 2 s (înmulțit cu un factor aleator între 1 și 1,5), MAX_RETRANSMIT 4, backoff exponențial (×2).
+- **NON:** fără retransmitere automată. Răspunsul la un NON este tot NON.
+- **Răspunsul serverului:** implicit piggybacked (ACK cu răspunsul). Pentru operații lente, serverul trimite întâi ACK 0.00, apoi răspunsul într-un CON separat, cu același token.
+- **Deduplicare:** după `(IP, port, Message ID)`, cu răspunsul reținut cel puțin 30 s. O cerere CON retransmisă nu se execută de două ori.
+- **Ping:** CON 0.00 (mesaj fără conținut), la care serverul răspunde cu RST având același Message ID.
+
+### Reguli pentru căi
+
+- Calea este relativă la rădăcina de stocare, iar `/fs` este rădăcina.
+- Segmentele `.` și `..` sunt respinse cu 4.00.
+- Segmentele se trimit doar ca opțiuni Uri-Path separate; numele sunt UTF-8 și nu conțin `/`.
+
+## Comportament în cazuri-limită
+
+Situații neacoperite explicit de specificația inițială și deciziile luate pentru ele.
+
+| Situație | Comportament |
+| :---- | :---- |
+| Încărcare peste un fișier existent | 4.09, fără suprascriere |
+| Încărcare sau creare director cu părinte inexistent | 4.04 |
+| Creare director care există deja | 4.09 |
+| Ștergere director nevid | 4.00 cu mesaj JSON |
+| Ștergere `/fs` | 4.05 |
+| Mutare cu destinație existentă | 4.09 |
+| Mutare cu sursă inexistentă sau părinte inexistent la destinație | 4.04 |
+| Mutare de directoare | Permisă |
+| `dest` din cererea MOVE | Aceleași reguli ca Uri-Path (fără `.`/`..`, cale sub `/fs`) |
+| Fișier mai mare de 50 MB | 4.13, verificat la primul bloc pe baza Size1 |
+| Bloc Block1 în afara ordinii | 4.08 |
+| Bloc Block1 duplicat (retransmisie) | Același răspuns ca prima dată |
+| Încărcare fără blocuri noi timp de 60 s | Sesiunea expiră, fișierul parțial este șters |
+| Fișier în curs de încărcare | Nu apare în listări până la ultimul bloc |
+| Listare care depășește un datagram | Se transferă pe blocuri (Block2). Un răspuns fără Block2 este complet |
+
+## Structura proiectului
+
+```
+.
+├── server.py          # punct de intrare, loop UDP
+├── coap/
+│   ├── message.py     # parsare / serializare mesaje CoAP
+│   ├── options.py     # opțiuni (delta, length extins)
+│   └── blocks.py      # logică Block1 / Block2
+├── storage/           # rădăcina de stocare implicită (mapată la /fs)
+├── tests/
+└── README.md
+```
+
+Adaptează structura la cea reală a proiectului.
+
+## Testare
+
+```bash
+python -m unittest discover tests
+```
+
+Pentru teste manuale se poate folosi clientul grafic al proiectului sau un client de test scris cu `socket`, care trimite mesaje CoAP construite manual.
+
+## Limitări cunoscute
+
+- Un singur nivel de deduplicare, în memorie: se pierde la repornirea serverului.
+- Dimensiunea blocului este fixată la 1024 B, iar un datagram complet (header + opțiuni + payload) poate depăși ușor MTU-ul de 1500 B pe unele rețele.
+- Nu există autentificare sau criptare (fără DTLS): proiect didactic, de folosit într-o rețea de încredere.
+- Metoda `MOVE` (0.08) este o extensie proprie și nu va fi recunoscută de alte clienți CoAP.
+
+## Referințe
+
+- [RFC 7252](https://www.rfc-editor.org/rfc/rfc7252) — The Constrained Application Protocol (CoAP)
+- [RFC 7959](https://www.rfc-editor.org/rfc/rfc7959) — Block-Wise Transfers in CoAP
+
+## Autori
+
+- `<numele tău>` — server
+- `<echipa clientului>` — client
